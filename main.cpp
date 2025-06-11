@@ -1,403 +1,302 @@
-#include <cstdio>
-#include <cstdlib>
+// main.cpp
+#include <iostream>
+#include <string>
+#include <map>
+#include <vector>
 #include <cstring>
-#include <pcap.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
+#include <cstdlib>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
 #include <arpa/inet.h>
-#include <netinet/in.h>
-#include <string>
-#include <unordered_map>
-#include <vector>
+#include <pcap.h>
 
 #include "ethhdr.h"
 #include "iphdr.h"
 #include "tcphdr.h"
-#include "ip.h"
+#include "mac.h"
 
-void usage()
+// 세션 키: srcIP, srcPort, dstIP, dstPort
+struct ConnKey
 {
-    printf("syntax : tls-block <interface> <server name>\n");
-    printf("sample : tls-block wlan0 naver.com\n");
-}
-
-#pragma pack(push, 1)
-struct PacketInfo
-{
-    EthHdr ethHdr_;
-    IpHdr ipHdr_;
-    TcpHdr tcpHdr_;
-};
-#pragma pack(pop)
-
-#pragma pack(push, 1)
-struct ChecksumHdr
-{
-    uint32_t srcAddr;
-    uint32_t dstAddr;
-    uint8_t reserved;
-    uint8_t proto;
-    uint16_t tcpLen;
-};
-#pragma pack(pop)
-
-typedef struct
-{
-    Mac mac;
-    Ip ip;
-} t_info;
-
-static t_info MyInfo;
-
-// ---- 재조립 로직 추가 ----
-struct FlowId
-{
-    Ip clientIp;
-    Ip serverIp;
-    uint16_t clientPort;
-    uint16_t serverPort;
-    bool operator==(FlowId const &o) const
+    Ip saddr;
+    uint16_t sport;
+    Ip daddr;
+    uint16_t dport;
+    bool operator<(ConnKey const &o) const
     {
-        return clientIp == o.clientIp && serverIp == o.serverIp && clientPort == o.clientPort && serverPort == o.serverPort;
+        if (saddr != o.saddr)
+            return saddr < o.saddr;
+        if (sport != o.sport)
+            return sport < o.sport;
+        if (daddr != o.daddr)
+            return daddr < o.daddr;
+        return dport < o.dport;
     }
 };
 
-namespace std
+// 분할된 TLS 조각을 저장할 맵
+static std::map<ConnKey, std::vector<uint8_t>> reassembly_map;
+
+// 16비트 빅엔디언 파싱
+static uint16_t read_u16(const uint8_t *p)
 {
-    template <>
-    struct hash<FlowId>
-    {
-        size_t operator()(FlowId const &f) const noexcept
-        {
-            uint64_t a = (uint64_t)f.clientIp << 32 | uint32_t(f.serverIp);
-            uint64_t b = (uint64_t)f.clientPort << 16 | f.serverPort;
-            return hash<uint64_t>()(a) ^ hash<uint64_t>()(b);
-        }
-    };
+    return (uint16_t(p[0]) << 8) | uint16_t(p[1]);
 }
 
-static std::unordered_map<FlowId, std::vector<uint8_t>> tlsReassembly;
-
-// 기존 함수들 유지
-int getMyInfo(t_info *info, const char *dev)
+// ClientHello 메시지에서 SNI 확장만 찾아 반환
+static std::string parseSniFromClientHello(const uint8_t *data, size_t len)
 {
-    struct ifreq ifr;
-    int fd = socket(PF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return -1;
+    // TLS Record (5바이트) 검사
+    if (len < 5 || data[0] != 0x16)
+        return {};
+    size_t rec_len = read_u16(data + 3);
+    if (5 + rec_len > len)
+        return {};
+    const uint8_t *ptr = data + 5;
+    size_t remain = rec_len;
+    // Handshake(1) | Len(3)
+    if (remain < 4 || ptr[0] != 0x01)
+        return {};
+    size_t hs_len = (size_t(ptr[1]) << 16) | (size_t(ptr[2]) << 8) | ptr[3];
+    ptr += 4;
+    remain -= 4;
+    if (hs_len + 4 > rec_len || remain < hs_len)
+        return {};
 
-    strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
-    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
-
-    // MAC address
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0)
+    // ClientHello 구조: 버전(2)+랜덤(32)+세션IDLen(1)+SessionID+CipherSuiteLen(2)+CipherSuites+
+    // CompressionLen(1)+Compressions+ExtensionsLen(2)+Extensions
+    // 대략적인 offset 계산
+    const uint8_t *end = ptr + hs_len;
+    // skip version+random
+    ptr += 2 + 32;
+    if (ptr + 1 > end)
+        return {};
+    // SessionID
+    uint8_t sidlen = *ptr++;
+    ptr += sidlen;
+    if (ptr + 2 > end)
+        return {};
+    // CipherSuites
+    uint16_t cslen = read_u16(ptr);
+    ptr += 2 + cslen;
+    if (ptr + 1 > end)
+        return {};
+    // Compression
+    uint8_t comlen = *ptr++;
+    ptr += comlen;
+    if (ptr + 2 > end)
+        return {};
+    // Extensions
+    uint16_t ext_total = read_u16(ptr);
+    ptr += 2;
+    const uint8_t *ext_end = ptr + ext_total;
+    while (ptr + 4 <= ext_end)
     {
-        info->mac = Mac(reinterpret_cast<uint8_t *>(ifr.ifr_hwaddr.sa_data));
-    }
-    else
-    {
-        close(fd);
-        return -1;
-    }
-
-    // IP address
-    if (ioctl(fd, SIOCGIFADDR, &ifr) == 0)
-    {
-        uint32_t raw = ntohl(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr);
-        info->ip = Ip(raw);
-    }
-    else
-    {
-        close(fd);
-        return -1;
-    }
-
-    printf("My MAC: %s\n", std::string(info->mac).c_str());
-    printf("My IP: %s\n", std::string(info->ip).c_str());
-    close(fd);
-    return 0;
-}
-
-uint16_t CheckSum(uint16_t *buffer, int size)
-{
-    uint32_t checksum = 0;
-    while (size > 1)
-    {
-        checksum += *buffer++;
-        size -= 2;
-    }
-    if (size > 0)
-    {
-        checksum += *(uint8_t *)buffer;
-    }
-    while (checksum >> 16)
-    {
-        checksum = (checksum & 0xFFFF) + (checksum >> 16);
-    }
-    return (uint16_t)(~checksum);
-}
-
-bool parseTlsSni(const uint8_t *data, uint32_t len, std::string &sni)
-{
-    // 기존 파싱 로직 그대로
-    if (len < 5)
-        return false;
-    uint32_t pos = 0;
-    uint8_t type = data[pos++];
-    if (type != 22)
-        return false;
-    pos += 2;
-    uint16_t recLen = (data[pos] << 8) | data[pos + 1];
-    pos += 2;
-    if (recLen + 5 > len)
-        return false;
-    if (data[pos++] != 1)
-        return false;
-    uint32_t hsLen = (data[pos] << 16) | (data[pos + 1] << 8) | data[pos + 2];
-    pos += 3;
-    if (hsLen + 4 > recLen)
-        return false;
-    pos += 2 + 32;
-    if (pos + 1 > len)
-        return false;
-    uint8_t sidLen = data[pos++];
-    pos += sidLen;
-    if (pos + 2 > len)
-        return false;
-    uint16_t csLen = (data[pos] << 8) | data[pos + 1];
-    pos += 2 + csLen;
-    if (pos + 1 > len)
-        return false;
-    uint8_t compLen = data[pos++];
-    pos += compLen;
-    if (pos + 2 > len)
-        return false;
-    uint16_t extLen = (data[pos] << 8) | data[pos + 1];
-    pos += 2;
-    uint32_t extEnd = pos + extLen;
-    while (pos + 4 <= extEnd)
-    {
-        uint16_t t = (data[pos] << 8) | data[pos + 1], sz = (data[pos + 2] << 8) | data[pos + 3];
-        pos += 4;
-        if (t == 0x0000)
-        {
-            if (pos + 2 > len)
-                return false;
-            uint16_t listLen = (data[pos] << 8) | data[pos + 1];
-            pos += 2;
-            uint32_t listEnd = pos + listLen;
-            while (pos + 3 <= listEnd)
+        uint16_t ext_type = read_u16(ptr);
+        uint16_t ext_len = read_u16(ptr + 2);
+        ptr += 4;
+        if (ptr + ext_len > ext_end)
+            break;
+        if (ext_type == 0x0000)
+        { // SNI extension
+            // ServerNameListLen(2)
+            uint16_t list_len = read_u16(ptr);
+            ptr += 2;
+            const uint8_t *lst_end = ptr + list_len;
+            while (ptr + 3 <= lst_end)
             {
-                uint8_t nameType = data[pos++];
-                uint16_t nameLen = (data[pos] << 8) | data[pos + 1];
-                pos += 2;
-                if (nameType == 0)
-                {
-                    if (pos + nameLen > len)
-                        return false;
-                    sni.assign((const char *)(data + pos), nameLen);
-                    return true;
-                }
-                pos += nameLen;
+                uint8_t name_type = *ptr++;
+                uint16_t namelen = read_u16(ptr);
+                ptr += 2;
+                if (ptr + namelen > lst_end)
+                    break;
+                // 첫 번째 호스트 이름만 반환
+                return std::string(reinterpret_cast<const char *>(ptr), namelen);
             }
-            return false;
         }
-        pos += sz;
+        ptr += ext_len;
     }
-    return false;
+    return {};
 }
 
-// ---- 재조립 함수 추가 ----
-bool accumulateTlsRecord(const FlowId &flow,
-                         const uint8_t *chunk,
-                         size_t chunkLen,
-                         std::string &outSni)
+// 조각 재조립 후 SNI 파싱
+static std::string processTlsFragment(ConnKey const &key,
+                                      const uint8_t *data,
+                                      size_t len,
+                                      bool isTls)
 {
-    auto &buf = tlsReassembly[flow];
-    buf.insert(buf.end(), chunk, chunk + chunkLen);
+    if (!isTls)
+        return {};
+    auto &buf = reassembly_map[key];
+    // 새 조각 합치기
+    buf.insert(buf.end(), data, data + len);
+    // 전체 레코드 길이 확인
     if (buf.size() < 5)
-        return false;
-    uint16_t recLen = (uint16_t(buf[3]) << 8) | buf[4];
-    size_t fullLen = 5 + recLen;
-    if (buf.size() < fullLen)
-        return false;
-    bool ok = parseTlsSni(buf.data(), fullLen, outSni);
-    tlsReassembly.erase(flow);
-    return ok;
+        return {};
+    uint16_t rec_len = read_u16(buf.data() + 3);
+    if (buf.size() < 5 + rec_len)
+        return {};
+    // 충분히 모였으면 SNI 파싱
+    std::string host = parseSniFromClientHello(buf.data(), buf.size());
+    // 사용했으면 버퍼 비우기
+    buf.clear();
+    return host;
+}
+
+static void sendRSTToServer(pcap_t *handle,
+                            const uint8_t *orig,
+                            const IpHdr *iph,
+                            const TcpHdr *tcph,
+                            uint16_t payloadLen,
+                            const Mac &myMac)
+{
+    int ethL = sizeof(EthHdr);
+    int ipL = iph->hl() * 4;
+    int tcpL = tcph->off() * 4;
+    int tot = ethL + ipL + tcpL;
+    std::vector<uint8_t> pkt(tot);
+    std::memcpy(pkt.data(), orig, tot);
+
+    auto *eth = reinterpret_cast<EthHdr *>(pkt.data());
+    eth->smac_ = myMac;
+
+    auto *ip2 = reinterpret_cast<IpHdr *>(pkt.data() + ethL);
+    ip2->len_ = htons(ipL + tcpL);
+    ip2->sum_ = 0;
+    ip2->sum_ = htons(IpHdr::calcChecksum(ip2));
+
+    auto *tcp2 = reinterpret_cast<TcpHdr *>(pkt.data() + ethL + ipL);
+    tcp2->seq_ = htonl(tcph->seq() + payloadLen);
+    tcp2->flags_ = TcpHdr::Rst | TcpHdr::Ack;
+    tcp2->sum_ = 0;
+    tcp2->sum_ = htons(TcpHdr::calcChecksum(ip2, tcp2));
+
+    if (pcap_sendpacket(handle, pkt.data(), tot) != 0)
+    {
+        std::cerr << "pcap_sendpacket error: "
+                  << pcap_geterr(handle) << "\n";
+    }
+}
+
+static void sendRSTToClient(const IpHdr *iph,
+                            const TcpHdr *tcph,
+                            uint16_t payloadLen)
+{
+    int ipL = iph->hl() * 4;
+    int tcpL = tcph->off() * 4;
+    int tot = ipL + tcpL;
+    std::vector<uint8_t> pkt(tot);
+    std::memset(pkt.data(), 0, tot);
+
+    auto *ip2 = reinterpret_cast<IpHdr *>(pkt.data());
+    ip2->v_hl_ = (4 << 4) | (ipL / 4);
+    ip2->len_ = htons(tot);
+    ip2->ttl_ = 128;
+    ip2->p_ = IpHdr::Tcp;
+    ip2->sip_ = htonl(iph->dip());
+    ip2->dip_ = htonl(iph->sip());
+    ip2->sum_ = 0;
+    ip2->sum_ = htons(IpHdr::calcChecksum(ip2));
+
+    auto *tcp2 = reinterpret_cast<TcpHdr *>(pkt.data() + ipL);
+    tcp2->sport_ = htons(tcph->dport());
+    tcp2->dport_ = htons(tcph->sport());
+    tcp2->seq_ = htonl(tcph->ack());
+    tcp2->ack_ = htonl(tcph->seq() + payloadLen);
+    tcp2->off_rsvd_ = uint8_t((tcpL / 4) << 4);
+    tcp2->flags_ = TcpHdr::Rst | TcpHdr::Ack;
+    tcp2->win_ = htons(60000);
+    tcp2->sum_ = 0;
+    tcp2->sum_ = htons(TcpHdr::calcChecksum(ip2, tcp2));
+
+    int sd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    int on = 1;
+    setsockopt(sd, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on));
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = tcp2->dport_;
+    dst.sin_addr.s_addr = ip2->dip_;
+    sendto(sd, pkt.data(), tot, 0,
+           reinterpret_cast<sockaddr *>(&dst),
+           sizeof(dst));
+    close(sd);
 }
 
 int main(int argc, char *argv[])
 {
     if (argc != 3)
     {
-        usage();
-        return -1;
+        std::cout << "syntax : tls-block <interface> <server_name>\n"
+                  << "sample : tls-block wlan0 naver.com\n";
+        return 0;
     }
-    const char *dev = argv[1];
-    const std::string target = argv[2];
-    char errbuf[PCAP_ERRBUF_SIZE];
+    std::string iface = argv[1];
+    std::string pattern = argv[2];
 
-    pcap_t *handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle = pcap_open_live(iface.c_str(), BUFSIZ, 1, -1, errbuf);
     if (!handle)
     {
-        fprintf(stderr, "couldn't open device %s: %s\n", dev, errbuf);
+        std::cerr << "pcap_open_live failed: " << errbuf << "\n";
         return -1;
     }
 
-    struct bpf_program fp;
-    if (pcap_compile(handle, &fp, "tcp dst port 443", 1, PCAP_NETMASK_UNKNOWN) < 0)
-    {
-        fprintf(stderr, "pcap_compile failed: %s\n", pcap_geterr(handle));
-        return -1;
-    }
-    if (pcap_setfilter(handle, &fp) < 0)
-    {
-        fprintf(stderr, "pcap_setfilter failed: %s\n", pcap_geterr(handle));
-        return -1;
-    }
-    pcap_freecode(&fp);
+    // 내 MAC 얻기
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ifreq ifr{};
+    std::strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ - 1);
+    ioctl(fd, SIOCGIFHWADDR, &ifr);
+    close(fd);
+    Mac myMac(reinterpret_cast<uint8_t *>(ifr.ifr_hwaddr.sa_data));
 
-    if (getMyInfo(&MyInfo, dev) < 0)
-    {
-        fprintf(stderr, "failed to get interface info for %s\n", dev);
-        pcap_close(handle);
-        return -1;
-    }
+    std::cout << "Blocking \"" << pattern
+              << "\" on " << iface << "\n";
 
-    int rsock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (rsock < 0)
-    {
-        perror("socket");
-        pcap_close(handle);
-        return -1;
-    }
-    int on = 1;
-    if (setsockopt(rsock, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on)) < 0)
-    {
-        perror("setsockopt");
-        close(rsock);
-        pcap_close(handle);
-        return -1;
-    }
-
+    pcap_pkthdr *hdr;
+    const uint8_t *pkt;
+    int count = 0;
     while (true)
     {
-        struct pcap_pkthdr *header;
-        const u_char *packet;
-        int res = pcap_next_ex(handle, &header, &packet);
-        if (res == 0)
-            continue;
-        if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK)
+        int res = pcap_next_ex(handle, &hdr, &pkt);
+        if (res != 1)
             break;
 
-        PacketInfo *pi = (PacketInfo *)packet;
-        if (pi->ethHdr_.type() != EthHdr::Ip4)
+        // Eth → IPv4 → TCP 필터
+        auto *eth = reinterpret_cast<const EthHdr *>(pkt);
+        if (eth->type() != EthHdr::Ip4)
+            continue;
+        auto *iph = reinterpret_cast<const IpHdr *>(pkt + sizeof(EthHdr));
+        if (iph->p() != IpHdr::Tcp)
             continue;
 
-        uint32_t ihl = pi->ipHdr_.hl() * 4;
-        if (pi->ipHdr_.p() != IpHdr::Tcp)
+        uint16_t ipL = iph->hl() * 4;
+        auto *tcph = reinterpret_cast<const TcpHdr *>(
+            pkt + sizeof(EthHdr) + ipL);
+        uint16_t tcpL = tcph->off() * 4;
+        uint16_t totL = iph->len();
+        uint16_t appL = totL - ipL - tcpL;
+        if (appL == 0)
             continue;
-        uint32_t ipTotal = pi->ipHdr_.len();
-        uint32_t thl = pi->tcpHdr_.off() * 4;
-        uint32_t dataLen = ipTotal - ihl - thl;
-        if (dataLen == 0)
-            continue;
 
-        const uint8_t *payload = packet + sizeof(EthHdr) + ihl + thl;
-        // --- 재조립 적용 ---
-        FlowId flow{pi->ipHdr_.sip(), pi->ipHdr_.dip(), pi->tcpHdr_.sport(), pi->tcpHdr_.dport()};
-        std::string sni;
-        if (!accumulateTlsRecord(flow, payload, dataLen, sni))
-            continue;
-        if (sni != target)
-            continue;
-        printf("Blocking SNI: %s\n", sni.c_str());
+        const uint8_t *payload = pkt + sizeof(EthHdr) + ipL + tcpL;
+        bool isTls = (appL > 5 && payload[0] == 0x16);
 
-        // --- Forward RST/ACK ---
-        PacketInfo *fpkt = (PacketInfo *)malloc(sizeof(PacketInfo));
-        memcpy(fpkt, packet, sizeof(PacketInfo));
-        fpkt->ethHdr_.smac_ = MyInfo.mac;
-        fpkt->ipHdr_.len_ = htons(ihl + thl);
-        fpkt->ipHdr_.sum_ = 0;
-        fpkt->ipHdr_.sum_ = CheckSum((uint16_t *)&fpkt->ipHdr_, sizeof(IpHdr));
+        ConnKey key{iph->sip(), tcph->sport(),
+                    iph->dip(), tcph->dport()};
+        std::string host =
+            processTlsFragment(key, payload, appL, isTls);
 
-        uint32_t origSeq = pi->tcpHdr_.seq();
-        uint32_t newSeq = origSeq + dataLen;
-        fpkt->tcpHdr_.seq_ = htonl(newSeq);
-        fpkt->tcpHdr_.flags_ = TcpHdr::Rst | TcpHdr::Ack;
-        fpkt->tcpHdr_.off_rsvd_ = (sizeof(TcpHdr) / 4) << 4;
-        fpkt->tcpHdr_.sum_ = 0;
-
-        ChecksumHdr phdr2;
-        memset(&phdr2, 0, sizeof(phdr2));
-        phdr2.srcAddr = (uint32_t)pi->ipHdr_.sip();
-        phdr2.dstAddr = (uint32_t)pi->ipHdr_.dip();
-        phdr2.proto = pi->ipHdr_.p();
-        phdr2.tcpLen = htons(sizeof(TcpHdr));
-
-        uint32_t csum2 = 0;
-        csum2 += CheckSum((uint16_t *)&fpkt->tcpHdr_, sizeof(TcpHdr));
-        csum2 += CheckSum((uint16_t *)&phdr2, sizeof(phdr2));
-        csum2 = (csum2 & 0xFFFF) + (csum2 >> 16);
-        fpkt->tcpHdr_.sum_ = (uint16_t)csum2;
-
-        pcap_sendpacket(handle, (const u_char *)fpkt, sizeof(PacketInfo));
-        free(fpkt);
-
-        // --- Backward RST/ACK ---
-        struct
+        if (!host.empty() && host.find(pattern) != std::string::npos)
         {
-            IpHdr ip;
-            TcpHdr tcp;
-        } bpkt;
-
-        memcpy(&bpkt.ip, &pi->ipHdr_, sizeof(IpHdr));
-        bpkt.ip.sip_ = pi->ipHdr_.dip_;
-        bpkt.ip.dip_ = pi->ipHdr_.sip_;
-        bpkt.ip.len_ = htons(ihl + thl);
-        bpkt.ip.ttl_ = 64;
-        bpkt.ip.sum_ = 0;
-        bpkt.ip.sum_ = CheckSum((uint16_t *)&bpkt.ip, sizeof(IpHdr));
-
-        memcpy(&bpkt.tcp, &pi->tcpHdr_, sizeof(TcpHdr));
-        bpkt.tcp.sport_ = pi->tcpHdr_.dport_;
-        bpkt.tcp.dport_ = pi->tcpHdr_.sport_;
-        bpkt.tcp.seq_ = pi->tcpHdr_.ack_;
-        uint32_t newAck2 = origSeq + dataLen;
-        bpkt.tcp.ack_ = htonl(newAck2);
-        bpkt.tcp.flags_ = TcpHdr::Rst | TcpHdr::Ack;
-        bpkt.tcp.off_rsvd_ = (sizeof(TcpHdr) / 4) << 4;
-        bpkt.tcp.sum_ = 0;
-
-        ChecksumHdr phdr3;
-        memset(&phdr3, 0, sizeof(phdr3));
-        phdr3.srcAddr = (uint32_t)bpkt.ip.sip_;
-        phdr3.dstAddr = (uint32_t)bpkt.ip.dip_;
-        phdr3.proto = bpkt.ip.p();
-        phdr3.tcpLen = htons(sizeof(TcpHdr));
-
-        uint32_t csum3 = 0;
-        csum3 += CheckSum((uint16_t *)&bpkt.tcp, sizeof(TcpHdr));
-        csum3 += CheckSum((uint16_t *)&phdr3, sizeof(phdr3));
-        csum3 = (csum3 & 0xFFFF) + (csum3 >> 16);
-        bpkt.tcp.sum_ = (uint16_t)csum3;
-
-        struct sockaddr_in sin;
-        memset(&sin, 0, sizeof(sin));
-        sin.sin_family = AF_INET;
-        sin.sin_addr.s_addr = inet_addr(std::string(pi->ipHdr_.sip()).c_str());
-
-        sendto(rsock,
-               &bpkt.ip,
-               sizeof(IpHdr) + sizeof(TcpHdr),
-               0,
-               (struct sockaddr *)&sin,
-               sizeof(sin));
+            std::cout << " [" << ++count
+                      << "] " << host << "\n";
+            sendRSTToServer(handle, pkt, iph, tcph, appL, myMac);
+            sendRSTToClient(iph, tcph, appL);
+        }
     }
 
-    close(rsock);
     pcap_close(handle);
     return 0;
 }
